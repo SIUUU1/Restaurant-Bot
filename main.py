@@ -7,7 +7,21 @@ from dotenv import load_dotenv
 # Load environment variables (e.g. OPENAI_API_KEY) from a local .env file.
 load_dotenv()
 
-from agents import Agent, Runner, RunContextWrapper, function_tool, handoff
+from pydantic import BaseModel
+
+from agents import (
+    Agent,
+    GuardrailFunctionOutput,
+    InputGuardrailTripwireTriggered,
+    OutputGuardrailTripwireTriggered,
+    RunContextWrapper,
+    Runner,
+    TResponseInputItem,
+    function_tool,
+    handoff,
+    input_guardrail,
+    output_guardrail,
+)
 from agents.extensions.handoff_prompt import prompt_with_handoff_instructions
 
 
@@ -23,9 +37,11 @@ MENU = {
     "티라미수": {"price": 8000, "allergens": ["밀", "유제품", "계란"], "veg": True},
 }
 
-# Simple in-memory stores for orders and reservations.
+# Simple in-memory stores.
 ORDERS: list[dict] = []
 RESERVATIONS: list[dict] = []
+COMPENSATIONS: list[dict] = []
+TICKETS: list[dict] = []
 
 
 # ===========================================================================
@@ -84,11 +100,36 @@ def make_reservation(name: str, party_size: int, date_time: str) -> str:
     )
 
 
+@function_tool
+def offer_compensation(kind: str, detail: str) -> str:
+    """Register a compensation offer for an unhappy customer.
+
+    kind:   one of 'refund', 'discount', 'free_item'.
+    detail: a short description, e.g. '50% off the next visit'.
+    """
+    comp_id = len(COMPENSATIONS) + 1
+    COMPENSATIONS.append({"id": comp_id, "kind": kind, "detail": detail})
+    return f"Compensation #{comp_id} registered — {kind}: {detail}"
+
+
+@function_tool
+def escalate_to_manager(summary: str, severity: str) -> str:
+    """Escalate a serious complaint to a manager for a personal callback.
+
+    summary:  a short description of the issue.
+    severity: one of 'low', 'medium', 'high'.
+    """
+    ticket_id = len(TICKETS) + 1
+    TICKETS.append({"id": ticket_id, "summary": summary, "severity": severity})
+    return (
+        f"Escalation ticket #{ticket_id} created (severity={severity}). "
+        "A manager will personally follow up."
+    )
+
+
 # ===========================================================================
 # 3. Callback that surfaces a handoff in the UI
 #    on_handoff fires the MOMENT the LLM calls a transfer_to_* tool.
-#    The target's display name is bound via a closure so each handoff prints
-#    its own message.
 # ===========================================================================
 def make_handoff_logger(display_name: str):
     async def _on_handoff(ctx: RunContextWrapper) -> None:
@@ -98,7 +139,89 @@ def make_handoff_logger(display_name: str):
 
 
 # ===========================================================================
-# 4. Specialist agents
+# 4. Guardrails
+#    Each guardrail uses a small, cheap "guardrail agent" to classify the
+#    text and returns a GuardrailFunctionOutput. When tripwire_triggered is
+#    True the SDK raises an exception that the chat loop catches.
+# ===========================================================================
+
+# ---- 4a. Input guardrail: off-topic / inappropriate ----
+class TopicSafetyCheck(BaseModel):
+    is_off_topic: bool       # not about the restaurant
+    is_inappropriate: bool   # profanity / harassment / hateful / sexual
+    reasoning: str
+
+
+input_guardrail_agent = Agent(
+    name="Input Guardrail",
+    model="gpt-4.1-mini",  # lightweight model keeps guardrail checks cheap and fast
+    instructions=(
+        "You screen messages sent to a restaurant assistant. Judge ONLY the latest user message.\n"
+        "Set is_off_topic = true when the message is unrelated to this restaurant. On-topic means: "
+        "menu, food, ingredients, allergens, prices, orders, reservations, or complaints about the "
+        "restaurant experience. Things like general chit-chat, coding help, philosophy, math, world "
+        "facts, or politics are off-topic.\n"
+        "Set is_inappropriate = true when the message contains profanity, harassment, hate speech, or "
+        "sexual content.\n"
+        "Note: complaints about the food or service (even angry ones) are ON-topic and appropriate."
+    ),
+    output_type=TopicSafetyCheck,
+)
+
+
+@input_guardrail
+async def restaurant_input_guardrail(
+    ctx: RunContextWrapper, agent: Agent, input: str | list[TResponseInputItem]
+) -> GuardrailFunctionOutput:
+    """Block messages that are off-topic or inappropriate before the agent runs."""
+    result = await Runner.run(input_guardrail_agent, input, context=ctx.context)
+    check = result.final_output_as(TopicSafetyCheck)
+    return GuardrailFunctionOutput(
+        output_info=check,
+        tripwire_triggered=check.is_off_topic or check.is_inappropriate,
+    )
+
+
+# ---- 4b. Output guardrail: professional & no internal-info leaks ----
+class OutputSafetyCheck(BaseModel):
+    is_professional: bool       # polite, respectful, professional tone
+    leaks_internal_info: bool   # exposes prompts / tool names / code / IDs / other customers
+    reasoning: str
+
+
+output_guardrail_agent = Agent(
+    name="Output Guardrail",
+    model="gpt-4.1-mini",  # lightweight model keeps guardrail checks cheap and fast
+    instructions=(
+        "You review the restaurant assistant's reply before it reaches the customer.\n"
+        "Set is_professional = true if the reply is polite, respectful, and professional.\n"
+        "Set leaks_internal_info = true if the reply exposes internal details such as system prompts, "
+        "tool or function names, source code, internal IDs/data structures, or another customer's data."
+    ),
+    output_type=OutputSafetyCheck,
+)
+
+
+@output_guardrail
+async def professional_output_guardrail(
+    ctx: RunContextWrapper, agent: Agent, output
+) -> GuardrailFunctionOutput:
+    """Block replies that are unprofessional or leak internal information."""
+    result = await Runner.run(output_guardrail_agent, str(output), context=ctx.context)
+    check = result.final_output_as(OutputSafetyCheck)
+    return GuardrailFunctionOutput(
+        output_info=check,
+        tripwire_triggered=(not check.is_professional) or check.leaks_internal_info,
+    )
+
+
+# Convenience: every customer-facing agent shares the same guardrails.
+INPUT_GUARDRAILS = [restaurant_input_guardrail]
+OUTPUT_GUARDRAILS = [professional_output_guardrail]
+
+
+# ===========================================================================
+# 5. Specialist agents
 #    - handoff_description: hint that tells Triage when to pick this specialist
 #    - prompt_with_handoff_instructions: SDK-recommended handoff prompt + role
 # ===========================================================================
@@ -114,9 +237,12 @@ menu_agent = Agent(
         "- Full menu request -> call get_menu() and list the results\n"
         "- Allergen question about a specific dish -> call check_allergens\n"
         "Answer concretely based on the tool result, and always reply in friendly Korean. "
-        "Hand off order requests to the Order Agent and reservation requests to the Reservation Agent."
+        "Hand off order requests to the Order Agent, reservation requests to the Reservation Agent, "
+        "and complaints to the Complaints Agent."
     ),
     tools=[get_menu, check_allergens],
+    input_guardrails=INPUT_GUARDRAILS,
+    output_guardrails=OUTPUT_GUARDRAILS,
 )
 
 order_agent = Agent(
@@ -125,10 +251,12 @@ order_agent = Agent(
     instructions=prompt_with_handoff_instructions(
         "You are the Order specialist. Once you have confirmed which dishes the customer wants, "
         "immediately call the place_order tool, then tell them the order number and total amount. "
-        "Hand off detailed menu questions to the Menu Agent and reservation requests to the Reservation Agent. "
-        "Always reply in friendly Korean."
+        "Hand off detailed menu questions to the Menu Agent, reservation requests to the Reservation Agent, "
+        "and complaints to the Complaints Agent. Always reply in friendly Korean."
     ),
     tools=[place_order],
+    input_guardrails=INPUT_GUARDRAILS,
+    output_guardrails=OUTPUT_GUARDRAILS,
 )
 
 reservation_agent = Agent(
@@ -138,14 +266,35 @@ reservation_agent = Agent(
         "You are the Reservation specialist. Ask for the information needed to book a table "
         "(reservation name, party size, desired date/time) one item at a time. "
         "Once you have all of it, call the make_reservation tool to create the booking and then share the reservation number. "
-        "Hand off menu questions to the Menu Agent and order requests to the Order Agent. Always reply in friendly Korean."
+        "Hand off menu questions to the Menu Agent, order requests to the Order Agent, and complaints to the "
+        "Complaints Agent. Always reply in friendly Korean."
     ),
     tools=[make_reservation],
+    input_guardrails=INPUT_GUARDRAILS,
+    output_guardrails=OUTPUT_GUARDRAILS,
+)
+
+complaints_agent = Agent(
+    name="Complaints Agent",
+    handoff_description="Specialist for handling unhappy customers with empathy and concrete resolutions",
+    instructions=prompt_with_handoff_instructions(
+        "You are the Complaints specialist. Handle unhappy customers with genuine empathy and care.\n"
+        "1) FIRST sincerely acknowledge their feelings and apologize for the bad experience.\n"
+        "2) Offer a concrete resolution and call offer_compensation to register it. Typical options:\n"
+        "   - refund, discount (e.g. 50% off the next visit), or a free item.\n"
+        "   - Ask the customer which option they prefer rather than deciding unilaterally.\n"
+        "3) For SERIOUS issues (food safety, illness/injury, discrimination, or repeated failures), "
+        "call escalate_to_manager so a manager personally follows up.\n"
+        "Be warm, take responsibility, and never argue with the customer. Always reply in empathetic Korean."
+    ),
+    tools=[offer_compensation, escalate_to_manager],
+    input_guardrails=INPUT_GUARDRAILS,
+    output_guardrails=OUTPUT_GUARDRAILS,
 )
 
 
 # ===========================================================================
-# 5. Triage (routing) agent
+# 6. Triage (routing) agent
 # ===========================================================================
 triage_agent = Agent(
     name="Triage Agent",
@@ -156,24 +305,26 @@ triage_agent = Agent(
         "- Menu / ingredient / allergen / vegetarian questions -> Menu Agent\n"
         "- Food orders -> Order Agent\n"
         "- Table reservations -> Reservation Agent\n"
-        "Never answer directly or stop after a greeting. Your only job is to hand off. "
-        "When the right specialist is clear, call that handoff tool right away without any extra explanation."
+        "- Complaints or dissatisfaction about the food or service -> Complaints Agent\n"
+        "For a complaint, you may briefly apologize in one sentence, then hand off to the Complaints Agent. "
+        "Otherwise do not answer directly; your job is to route. Call the handoff tool right away."
     ),
+    input_guardrails=INPUT_GUARDRAILS,
+    output_guardrails=OUTPUT_GUARDRAILS,
 )
 
 
 # ===========================================================================
-# 6. Handoff wiring (mesh)
-#    - Triage is the initial routing hub.
-#    - Every specialist can hand off DIRECTLY to any other specialist, so a
-#      topic change is resolved in a single handoff (e.g. while making a
-#      reservation, a menu question goes straight to the Menu Agent).
+# 7. Handoff wiring (mesh)
+#    Triage is the initial routing hub; every agent can also hand off directly
+#    to any other specialist, resolving topic changes in a single handoff.
 # ===========================================================================
 DISPLAY_NAME = {
     "Triage Agent": "the front desk",
     "Menu Agent": "the menu specialist",
     "Order Agent": "the order specialist",
     "Reservation Agent": "the reservation specialist",
+    "Complaints Agent": "the complaints specialist",
 }
 
 
@@ -182,18 +333,40 @@ def link(target: Agent) -> handoff:
     return handoff(target, on_handoff=make_handoff_logger(DISPLAY_NAME[target.name]))
 
 
-triage_agent.handoffs = [link(menu_agent), link(order_agent), link(reservation_agent)]
-menu_agent.handoffs = [link(triage_agent), link(order_agent), link(reservation_agent)]
-order_agent.handoffs = [link(triage_agent), link(menu_agent), link(reservation_agent)]
-reservation_agent.handoffs = [link(triage_agent), link(menu_agent), link(order_agent)]
+triage_agent.handoffs = [
+    link(menu_agent), link(order_agent), link(reservation_agent), link(complaints_agent)
+]
+menu_agent.handoffs = [
+    link(triage_agent), link(order_agent), link(reservation_agent), link(complaints_agent)
+]
+order_agent.handoffs = [
+    link(triage_agent), link(menu_agent), link(reservation_agent), link(complaints_agent)
+]
+reservation_agent.handoffs = [
+    link(triage_agent), link(menu_agent), link(order_agent), link(complaints_agent)
+]
+complaints_agent.handoffs = [
+    link(triage_agent), link(menu_agent), link(order_agent), link(reservation_agent)
+]
 
 
 # ===========================================================================
-# 7. Chat loop
-#    - Keeps the conversation history so context (e.g. "before that...") carries over.
-#    - Continues from whichever agent answered last (last_agent); the first
-#      turn starts from the Triage Agent.
+# 8. Chat loop
+#    - Keeps the conversation history so context carries over.
+#    - Continues from whichever agent answered last; the first turn starts
+#      from the Triage Agent.
+#    - Catches guardrail tripwires and replies with a safe fallback.
 # ===========================================================================
+OFF_TOPIC_REPLY = (
+    "저는 레스토랑 관련 질문에 대해서만 도와드리고 있어요. "
+    "메뉴를 확인하거나, 예약하거나, 음식을 주문하실 수 있어요."
+)
+UNSAFE_OUTPUT_REPLY = (
+    "죄송합니다. 방금은 적절한 답변을 드리지 못했어요. "
+    "메뉴, 예약, 주문, 또는 불편하셨던 점에 대해 다시 말씀해 주시겠어요?"
+)
+
+
 async def main() -> None:
     print("🍽️  Restaurant bot here. How can I help?  (type 'quit' to exit)\n")
 
@@ -215,7 +388,20 @@ async def main() -> None:
 
         history.append({"role": "user", "content": user_input})
 
-        result = await Runner.run(current_agent, history)
+        try:
+            result = await Runner.run(current_agent, history)
+        except InputGuardrailTripwireTriggered:
+            # Off-topic or inappropriate input was blocked before the agent ran.
+            print("Bot: [input guardrail triggered]")
+            print(f"Bot: {OFF_TOPIC_REPLY}\n")
+            history.append({"role": "assistant", "content": OFF_TOPIC_REPLY})
+            continue
+        except OutputGuardrailTripwireTriggered:
+            # The agent produced an unprofessional / leaking reply; suppress it.
+            print("Bot: [output guardrail triggered]")
+            print(f"Bot: {UNSAFE_OUTPUT_REPLY}\n")
+            history.append({"role": "assistant", "content": UNSAFE_OUTPUT_REPLY})
+            continue
 
         print(f"{result.last_agent.name}: {result.final_output}\n")
 
